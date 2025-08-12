@@ -10,7 +10,7 @@ const { S3Client, PutObjectCommand, ListObjectsV2Command, GetObjectCommand } = r
 // --- ⚙️ CONFIGURATION ---
 const BUCKET_NAME = 'bb20-rainfall-data-storage';
 const RECIPIENT_EMAILS = [
-  'sruthipr027@gmail.com','	chandrachud.bhadbhade1@bigbasket.com','chakradhar.guha@bigbasket.com','sahil@ebhoom.com','ganapathi@bigbasket.com'
+  'sruthipr027@gmail.com','chandrachud.bhadbhade1@bigbasket.com','chakradhar.guha@bigbasket.com','sahil@ebhoom.com','ganapathi@bigbasket.com'
 ];
 const PORT = process.env.PORT || 3000;
 const MQTT_BROKER_URL = 'mqtt://13.201.98.218:1883';
