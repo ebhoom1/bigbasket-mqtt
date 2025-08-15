@@ -151,7 +151,7 @@ app.get('/rain-events/:productId', async (req, res) => {
 
 
 // 5. Scheduled Hourly Email Report
-cron.schedule('* * * * *', async () => {
+cron.schedule('0 * * * *', async () => {
   console.log('\n--- ⏰ Hourly Report Task Triggered ---');
   
   if (Object.keys(hourlyData).length === 0) {
