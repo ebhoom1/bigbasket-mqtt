@@ -198,11 +198,11 @@ cron.schedule('0 * * * *', async () => {
 
     if (userName === 'BB21') {
         // Updated table structure for BB21
-        tableHeadersHTML = `<tr><th>Date & Time</th><th>Tips</th><th>Status</th><th>Intensity</th></tr>`;
+        tableHeadersHTML = `<tr><th>Date & Time</th><th>Status</th><th>Intensity</th></tr>`;
         tableRowsHTML = deviceData.map(d => 
             `<tr>
                 <td>${d.date_time ?? 'N/A'}</td>
-                <td>${d.tips ?? 'N/A'}</td>
+               
                 <td>${d.status ?? 'N/A'}</td>
                 <td>${d.intensity ?? 'N/A'}</td>
             </tr>`
