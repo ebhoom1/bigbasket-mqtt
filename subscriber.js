@@ -44,11 +44,31 @@ async function processRainfallData(data) {
     // --- IMMEDIATE RAIN ALERT ---
     if (data.status === 'Rain Detected') {
         console.log(`☔️ Rain detected by ${data.userName}! Sending immediate alert.`);
+
+        // Build alert body differently for BB21
+        let alertHtml = '';
+        if (data.userName === 'BB21') {
+            alertHtml = `<h1>Immediate Rain Alert</h1>
+                         <p>Rain has started at device <strong>${data.userName}</strong>.</p>
+                         <ul>
+                           <li><strong>Time:</strong> ${data.date_time}</li>
+                           <li><strong>Tips:</strong> ${data.tips}</li>
+                           <li><strong>Intensity:</strong> ${data.intensity}</li>
+                         </ul>`;
+        } else {
+            alertHtml = `<h1>Immediate Rain Alert</h1>
+                         <p>Rain has started at the location of device <strong>${data.userName}</strong>.</p>
+                         <ul>
+                           <li><strong>Time:</strong> ${data.date_time}</li>
+                           <li><strong>Intensity:</strong> ${data.intensity}</li>
+                         </ul>`;
+        }
+
         const alertMailOptions = {
             from: `"Rain Alert" <${process.env.GMAIL_USER}>`,
             to: RECIPIENT_EMAILS.join(', '),
             subject: `🚨 Rain Alert: Rain Detected by ${data.userName}`,
-            html: `<h1>Immediate Rain Alert</h1><p>Rain has started at the location of device <strong>${data.userName}</strong>.</p><ul><li><strong>Time:</strong> ${data.date_time}</li><li><strong>Intensity:</strong> ${data.intensity}</li></ul>`
+            html: alertHtml
         };
         mailTransporter.sendMail(alertMailOptions).catch(err => console.error('❌ Failed to send rain alert email:', err));
     }
@@ -173,23 +193,22 @@ cron.schedule('0 * * * *', async () => {
     console.log(`Generating report for ${userName} with ${deviceData.length} records...`);
 
     // =========================== CUSTOM LOGIC IS HERE ============================
-    // Declare variables for the table parts
     let tableHeadersHTML = '';
     let tableRowsHTML = '';
 
-    // Check the userName and create the appropriate table structure
     if (userName === 'BB21') {
-        // Simple table structure for BB21
-        tableHeadersHTML = `<tr><th>Date</th><th>Time</th><th>Status</th></tr>`;
+        // Updated table structure for BB21
+        tableHeadersHTML = `<tr><th>Date & Time</th><th>Tips</th><th>Status</th><th>Intensity</th></tr>`;
         tableRowsHTML = deviceData.map(d => 
             `<tr>
-                <td>${d.date ?? 'N/A'}</td>
-                <td>${d.time ?? 'N/A'}</td>
+                <td>${d.date_time ?? 'N/A'}</td>
+                <td>${d.tips ?? 'N/A'}</td>
                 <td>${d.status ?? 'N/A'}</td>
+                <td>${d.intensity ?? 'N/A'}</td>
             </tr>`
         ).join('');
     } else {
-        // Detailed table structure for BB20 and all other devices
+        // Existing detailed structure for BB20 and others
         tableHeadersHTML = `<tr><th>Date & Time</th><th>Rainfall Increment (mm)</th><th>Today's Total (mm)</th><th>Status</th><th>Intensity</th><th>Intensity Range mm</th></tr>`;
         tableRowsHTML = deviceData.map(d => 
             `<tr>
@@ -203,7 +222,6 @@ cron.schedule('0 * * * *', async () => {
         ).join('');
     }
     
-    // Assemble the final HTML body using the dynamically created table parts
     const htmlBody = `<!DOCTYPE html><html><head><style>body{font-family:sans-serif}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;text-align:left;padding:8px}th{background-color:#f2f2f2}h1{color:#333}</style></head><body><h1>Hourly Report for Device ${userName}</h1><h2>${reportHeading}</h2><table><thead>${tableHeadersHTML}</thead><tbody>${tableRowsHTML}</tbody></table></body></html>`;
     // =============================================================================
 
