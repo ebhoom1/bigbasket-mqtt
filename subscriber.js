@@ -5,12 +5,13 @@ const express = require('express');
 const mqtt = require('mqtt');
 const cron = require('node-cron');
 const nodemailer = require('nodemailer');
+const PDFDocument = require('pdfkit');
 const { S3Client, PutObjectCommand, ListObjectsV2Command, GetObjectCommand } = require('@aws-sdk/client-s3');
 
 // --- ⚙️ CONFIGURATION ---
 const BUCKET_NAME = 'bb20-rainfall-data-storage';
 const RECIPIENT_EMAILS = [
-  'sruthipr027@gmail.com','chandrachud.bhadbhade1@bigbasket.com','chakradhar.guha@bigbasket.com','sahil@ebhoom.com','ganapathi@bigbasket.com'
+  'sruthipr027@gmail.com' ,'chandrachud.bhadbhade1@bigbasket.com','chakradhar.guha@bigbasket.com','sahil@ebhoom.com','ganapathi@bigbasket.com' 
 ];
 const ALERT_RECIPIENT = 'sahil@ebhoom.com'; // ✅ rain alerts go only here
 const PORT = process.env.PORT || 3000;
@@ -35,6 +36,30 @@ let hourlyData = {};
 
 // small helper
 const fmt = (n, d = 9) => (typeof n === 'number' ? n.toFixed(d) : (n ?? 'N/A'));
+
+// ---------- S3 HELPERS (pagination + fetch JSON) ----------
+async function listAllKeys(prefix) {
+  let keys = [];
+  let token = undefined;
+
+  do {
+    const resp = await s3Client.send(new ListObjectsV2Command({
+      Bucket: BUCKET_NAME,
+      Prefix: prefix,
+      ContinuationToken: token
+    }));
+    if (resp.Contents) keys.push(...resp.Contents.map(o => o.Key));
+    token = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+  } while (token);
+
+  return keys;
+}
+
+async function getJsonFromS3(key) {
+  const obj = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
+  const txt = await obj.Body.transformToString();
+  return JSON.parse(txt);
+}
 
 // --- 💧 REUSABLE FUNCTION for processing data ---
 async function processRainfallData(data) {
@@ -181,6 +206,348 @@ app.get('/rain-events/:productId', async (req, res) => {
   }
 });
 
+// ---------- Helpers shared by PDF & CSV export ----------
+const PRODUCT_ID_BB21 = '21';
+const PREFIX_BB21 = `data/${PRODUCT_ID_BB21}/`;
+
+// Combine old (date + time) or new (date_time)
+function getCombinedDT(row) {
+  if (row.date && row.time) return `${row.date} ${row.time}`;
+  return row.date_time || '';
+}
+function parseDT(s) {
+  if (!s) return null;
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+function csvEscape(v) {
+  if (v === null || v === undefined) return '';
+  const s = String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+// ---------- NEW: BB21 Full Export as CSV ----------
+/**
+ * GET /bb21/data.csv
+ * Streams a CSV containing ALL records for device BB21 (product_id = "21")
+ * Columns: date_time (auto from date+time or date_time), today_rainfall_mm, status, intensity
+ * Optional query: ?from=YYYY-MM-DD&to=YYYY-MM-DD  (filters by combined timestamp)
+ */
+app.get('/bb21/data.csv', async (req, res) => {
+  try {
+    const keys = await listAllKeys(PREFIX_BB21);
+    if (!keys.length) {
+      return res.status(404).json({ status: 'error', message: 'No data found for BB21.' });
+    }
+
+    // Prepare streaming CSV response
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="BB21-data.csv"');
+
+    // CSV header
+    res.write('date_time,today_rainfall_mm,status,intensity\n');
+
+    // Optional filters
+    const { from, to } = req.query;
+    const fromDT = from ? parseDT(`${from}T00:00:00`) : null;
+    const toDT   = to   ? parseDT(`${to}T23:59:59.999`) : null;
+
+    // Process in batches to be memory-safe
+    const BATCH = 50;
+    for (let i = 0; i < keys.length; i += BATCH) {
+      const slice = keys.slice(i, i + BATCH);
+      const batch = await Promise.all(slice.map(k => getJsonFromS3(k).catch(() => null)));
+
+      // Build rows for this batch
+      const rows = [];
+      for (const rec of batch) {
+        if (!rec || rec.userName !== 'BB21') continue;
+
+        const combined = getCombinedDT(rec);
+        const dt = parseDT(combined);
+        if (fromDT && (!dt || dt < fromDT)) continue;
+        if (toDT && (!dt || dt > toDT)) continue;
+
+        const row = [
+          csvEscape(combined),
+          csvEscape(typeof rec.today_rainfall_mm === 'number' ? rec.today_rainfall_mm : ''),
+          csvEscape(rec.status ?? ''),
+          csvEscape(rec.intensity ?? '')
+        ].join(',');
+
+        rows.push(row);
+      }
+
+      if (rows.length) {
+        // Sort by timestamp inside this batch for a nicer output (optional)
+        rows.sort((a, b) => {
+          const ta = parseDT(a.split(',')[0].replace(/^"|"$/g, ''))?.getTime() ?? 0;
+          const tb = parseDT(b.split(',')[0].replace(/^"|"$/g, ''))?.getTime() ?? 0;
+          return ta - tb;
+        });
+        res.write(rows.join('\n') + '\n');
+      }
+    }
+
+    res.end();
+  } catch (err) {
+    console.error('❌ /bb21/data.csv error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ status: 'error', message: 'Failed to generate CSV for BB21.', details: err.message });
+    } else {
+      res.end();
+    }
+  }
+});
+
+// ---------- Existing: BB21 Full Export as PDF (kept; remove if not needed) ----------
+/**
+ * GET /bb21/data.pdf
+ * Streams a PDF containing ALL records for device BB21 (product_id = "21")
+ * Columns: date_time, today_rainfall_mm, status, intensity
+ * Optional query: ?from=YYYY-MM-DD&to=YYYY-MM-DD
+ */
+app.get('/bb21/data.pdf', async (req, res) => {
+  try {
+    const keys = await listAllKeys(PREFIX_BB21);
+    if (!keys.length) {
+      return res.status(404).json({ status: 'error', message: 'No data found for BB21.' });
+    }
+
+    // Load & parse in modest batches to avoid memory spikes
+    const BATCH = 50;
+    const rows = [];
+    for (let i = 0; i < keys.length; i += BATCH) {
+      const slice = keys.slice(i, i + BATCH);
+      const batch = await Promise.all(slice.map(k => getJsonFromS3(k).catch(() => null)));
+      for (const rec of batch) {
+        if (!rec || rec.userName !== 'BB21') continue;
+        rows.push({
+          date: rec.date ?? '',
+          time: rec.time ?? '',
+          date_time: rec.date_time ?? '',
+          today_rainfall_mm: typeof rec.today_rainfall_mm === 'number' ? rec.today_rainfall_mm : '',
+          status: rec.status ?? '',
+          intensity: rec.intensity ?? ''
+        });
+      }
+    }
+
+    if (!rows.length) {
+      return res.status(404).json({ status: 'error', message: 'No BB21 records parsed from S3.' });
+    }
+
+    // Optional date filter via query (?from=YYYY-MM-DD&to=YYYY-MM-DD)
+    const { from, to } = req.query;
+    let filtered = rows;
+
+    if (from) {
+      const fromDT = parseDT(`${from}T00:00:00`);
+      filtered = filtered.filter(r => {
+        const d = parseDT(getCombinedDT(r));
+        return d && d >= fromDT;
+      });
+    }
+    if (to) {
+      const toDT = parseDT(`${to}T23:59:59.999`);
+      filtered = filtered.filter(r => {
+        const d = parseDT(getCombinedDT(r));
+        return d && d <= toDT;
+      });
+    }
+
+    // Sort by combined date-time asc
+    filtered.sort((a, b) => {
+      const da = parseDT(getCombinedDT(a))?.getTime() ?? 0;
+      const db = parseDT(getCombinedDT(b))?.getTime() ?? 0;
+      return da - db;
+    });
+
+    // Prepare PDF response
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="BB21-data.pdf"`);
+
+    const doc = new PDFDocument({ margin: 36, size: 'A4' });
+    doc.pipe(res);
+
+    // Header
+    doc.fontSize(16).text('BB21 – Full Data Export', { align: 'left' });
+    doc.moveDown(0.2);
+    const nowIST = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    const rangeLine = (from || to) ? `Filtered: ${from ?? '...'} to ${to ?? '...'}` : 'Range: ALL';
+    doc.fontSize(10).fillColor('#333').text(`Generated: ${nowIST} IST`, { align: 'left' });
+    doc.text(rangeLine, { align: 'left' });
+    doc.moveDown(0.5);
+
+    // Table header
+    const col = [
+      { key: 'date_time', label: 'date_time', width: 160 },
+      { key: 'today_rainfall_mm', label: 'today_rainfall_mm', width: 130 },
+      { key: 'status', label: 'status', width: 110 },
+      { key: 'intensity', label: 'intensity', width: 110 },
+    ];
+    const startX = doc.x;
+    let y = doc.y;
+
+    doc.fontSize(10).fillColor('#000').text('', startX, y);
+    let x = startX;
+
+    // Draw header row
+    doc.font('Helvetica-Bold');
+    for (const c of col) {
+      doc.text(c.label, x, y, { width: c.width });
+      x += c.width + 8;
+    }
+    y += 16;
+    doc.moveTo(startX, y).lineTo(startX + col.reduce((a, c) => a + c.width, 0) + (8 * (col.length - 1)), y).stroke();
+    doc.font('Helvetica');
+
+    // Row writer with pagination
+    const lineH = 14;
+    const bottom = doc.page.margins.bottom + 36;
+
+    function writeRow(r) {
+      let x = startX;
+      let rowHeight = lineH;
+
+      // Page break check
+      if (y + rowHeight > doc.page.height - bottom) {
+        doc.addPage();
+        y = doc.y;
+
+        // redraw header on new page
+        let xh = startX;
+        doc.font('Helvetica-Bold');
+        for (const c of col) {
+          doc.text(c.label, xh, y, { width: c.width });
+          xh += c.width + 8;
+        }
+        y += 16;
+        doc.moveTo(startX, y).lineTo(startX + col.reduce((a, c) => a + c.width, 0) + (8 * (col.length - 1)), y).stroke();
+        doc.font('Helvetica');
+      }
+
+      // Use old (date+time) or new (date_time)
+      const combinedDT = getCombinedDT(r);
+
+      const vals = [
+        combinedDT,
+        (typeof r.today_rainfall_mm === 'number') ? r.today_rainfall_mm.toFixed(9) : '',
+        r.status || '',
+        r.intensity || ''
+      ];
+
+      for (let i = 0; i < col.length; i++) {
+        doc.text(vals[i], x, y + 2, { width: col[i].width });
+        x += col[i].width + 8;
+      }
+      y += rowHeight;
+    }
+
+    filtered.forEach(writeRow);
+
+    // Footer
+    doc.moveDown();
+    doc.text(`\nTotal records: ${filtered.length}`, { align: 'left' });
+
+    doc.end();
+  } catch (err) {
+    console.error('❌ /bb21/data.pdf error:', err);
+    res.status(500).json({ status: 'error', message: 'Failed to generate PDF for BB21.', details: err.message });
+  }
+});
+// ---------- NEW: Generic Full Export as CSV by Product ID ----------
+/**
+ * GET /data/:productId.csv
+ * Streams a CSV containing ALL records for a given device.
+ * Columns are customized based on the known product ID.
+ * Optional query: ?from=YYYY-MM-DD&to=YYYY-MM-DD (filters by combined timestamp)
+ */
+app.get('/data/:productId.csv', async (req, res) => {
+  const { productId } = req.params;
+  const prefix = `data/${productId}/`;
+  console.log(`\n--- CSV Export Request for Product ID: ${productId} ---`);
+
+  // Define columns based on product ID
+  let columns;
+  // UPDATED: BB20 now uses the same simple format as BB21
+  if (productId === '20' || productId === '21') {
+    columns = ['date_time', 'today_rainfall_mm', 'status', 'intensity'];
+  } else {
+    return res.status(404).json({
+      status: 'error',
+      message: `CSV export is not configured for product ID '${productId}'.`,
+    });
+  }
+
+  try {
+    const keys = await listAllKeys(prefix);
+    if (!keys.length) {
+      return res.status(404).json({ status: 'error', message: `No data found for product ID ${productId}.` });
+    }
+
+    // Prepare streaming CSV response
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${productId}-data.csv"`);
+
+    // CSV header
+    res.write(columns.join(',') + '\n');
+
+    // Optional date range filters
+    const { from, to } = req.query;
+    const fromDT = from ? parseDT(`${from}T00:00:00`) : null;
+    const toDT = to ? parseDT(`${to}T23:59:59.999`) : null;
+
+    if (from || to) {
+        console.log(`Filtering data from: ${from || 'start'} to: ${to || 'end'}`);
+    }
+
+    // Process in batches to be memory-safe
+    const BATCH_SIZE = 50;
+    for (let i = 0; i < keys.length; i += BATCH_SIZE) {
+      const keySlice = keys.slice(i, i + BATCH_SIZE);
+      const batchData = await Promise.all(
+        keySlice.map(k => getJsonFromS3(k).catch(() => null))
+      );
+      
+      const rows = [];
+      for (const record of batchData) {
+        if (!record) continue;
+
+        // Apply date range filter
+        const combinedDT = getCombinedDT(record);
+        const recordDate = parseDT(combinedDT);
+        if (fromDT && (!recordDate || recordDate < fromDT)) continue;
+        if (toDT && (!recordDate || recordDate > toDT)) continue;
+
+        const rowValues = columns.map(col => {
+           // Use the combined date/time field if the column is 'date_time'
+           const value = (col === 'date_time') ? combinedDT : record[col];
+           return csvEscape(value);
+        });
+        
+        rows.push(rowValues.join(','));
+      }
+
+      if (rows.length) {
+        res.write(rows.join('\n') + '\n');
+      }
+    }
+
+    res.end();
+  } catch (err) {
+    console.error(`❌ /data/${productId}.csv error:`, err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to generate CSV.',
+        details: err.message
+      });
+    } else {
+      res.end();
+    }
+  }
+});
 // 5. Scheduled Hourly Email Report (still to full list)
 cron.schedule('0 * * * *', async () => {
   console.log('\n--- ⏰ Hourly Report Task Triggered ---');
@@ -208,8 +575,8 @@ cron.schedule('0 * * * *', async () => {
     let tableHeadersHTML = '';
     let tableRowsHTML = '';
 
-    if (userName === 'BB21') {
-      // BB21: EXACTLY the requested fields
+    // UPDATED: Both BB20 and BB21 now use this simple format
+    if (userName === 'BB20' || userName === 'BB21') {
       tableHeadersHTML = `
         <tr>
           <th>date_time</th>
@@ -230,7 +597,7 @@ cron.schedule('0 * * * *', async () => {
         })
         .join('');
     } else {
-      // Existing detailed structure for BB20 and others
+      // Fallback detailed structure for any other devices
       tableHeadersHTML = `
         <tr>
           <th>Date & Time</th>
@@ -281,7 +648,7 @@ cron.schedule('0 * * * *', async () => {
 
     const mailOptions = {
       from: `"Rainfall Report" <${process.env.GMAIL_USER}>`,
-      to: RECIPIENT_EMAILS.join(', '), // ✅ reports still to all
+      to: RECIPIENT_EMAILS.join(', '),
       subject: `Hourly Rainfall Report: ${userName}`,
       html: htmlBody,
     };
@@ -307,6 +674,3 @@ client.on('offline', () => console.log('❌ Client has gone offline.'));
 client.on('error', (error) => {
   console.error('MQTT Connection error:', error);
 });
-
-
-//,'chandrachud.bhadbhade1@bigbasket.com','chakradhar.guha@bigbasket.com','sahil@ebhoom.com','ganapathi@bigbasket.com'

@@ -16,6 +16,7 @@
     "express": "^5.1.0",
     "mqtt": "^5.13.3",
     "node-cron": "^4.2.1",
-    "nodemailer": "^7.0.5"
+    "nodemailer": "^7.0.5",
+    "pdfkit": "^0.17.1"
   }
 }
